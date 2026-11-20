@@ -39,6 +39,8 @@ class DdlRecord:
     rollback_statement: str
     column_changes: list[dict[str, Any]] = field(default_factory=list)
     partition_changes: list[dict[str, Any]] = field(default_factory=list)
+    stmt_no: int = 0
+    partition_version: int = 0
 
 
 @dataclass
@@ -94,6 +96,11 @@ class PipelineBus:
         self.filter_rules: list[dict[str, Any]] = []
         # 快照比对结果
         self.compare_results: list[dict[str, Any]] = []
+        # 分区写入权限注册表：partition_key(库.表.分区) -> 权限状态
+        # 维护团队交接时可收回写权限，分区同步执行前必须重新核对
+        self.partition_write_grants: dict[str, dict[str, Any]] = {}
+        # 目标侧已落库的分区版本：partition_key -> 已应用版本号
+        self.partition_applied_versions: dict[str, int] = {}
         # 审计日志
         self.audit_log: list[dict[str, Any]] = []
         # 延迟指标缓冲
@@ -156,6 +163,81 @@ class PipelineBus:
     def get_recent_ddls(self, limit: int = 50) -> list[DdlRecord]:
         """查询最近 DDL 记录。"""
         return self.ddl_log[-limit:]
+
+    @staticmethod
+    def partition_key(database: str, table: str, partition: str) -> str:
+        """统一的分区权限/版本注册表键。"""
+        return f"{database}.{table}.{partition}"
+
+    def grant_partition_write(
+        self, database: str, table: str, partition: str, owner_team: str,
+        scope: str = "读写",
+    ) -> dict[str, Any]:
+        """授予（或恢复）目标分区写权限，并登记维护团队与数据范围。"""
+        key = self.partition_key(database, table, partition)
+        grant = {
+            "key": key,
+            "database": database,
+            "table": table,
+            "partition": partition,
+            "owner_team": owner_team,
+            "scope": scope,
+            "writable": True,
+            "updated_at": datetime.now().isoformat(),
+        }
+        self.partition_write_grants[key] = grant
+        return dict(grant)
+
+    def revoke_partition_write(self, database: str, table: str, partition: str,
+                               reason: str = "维护团队交接") -> dict[str, Any] | None:
+        """收回目标分区写权限（交接场景），保留读权限。"""
+        key = self.partition_key(database, table, partition)
+        grant = self.partition_write_grants.get(key)
+        if grant is None:
+            return None
+        grant["writable"] = False
+        grant["scope"] = "只读"
+        grant["revoke_reason"] = reason
+        grant["updated_at"] = datetime.now().isoformat()
+        return dict(grant)
+
+    def check_partition_write(self, database: str, table: str,
+                              partition: str) -> dict[str, Any]:
+        """执行前重新核对目标分区写权限；未登记的分区默认按只读处理。"""
+        key = self.partition_key(database, table, partition)
+        grant = self.partition_write_grants.get(key)
+        if grant is None:
+            return {
+                "key": key,
+                "partition": partition,
+                "writable": False,
+                "scope": "未授权",
+                "owner_team": "",
+                "reason": "未登记写权限，按只读处理",
+            }
+        return {
+            "key": key,
+            "partition": partition,
+            "writable": bool(grant.get("writable")),
+            "scope": grant.get("scope", "只读"),
+            "owner_team": grant.get("owner_team", ""),
+            "reason": "" if grant.get("writable") else grant.get("revoke_reason", "写权限未生效"),
+        }
+
+    def mark_partition_version_applied(self, database: str, table: str,
+                                       partition: str, version: int) -> int:
+        """登记目标分区已落库的分区版本，用于幂等判断。"""
+        key = self.partition_key(database, table, partition)
+        current = self.partition_applied_versions.get(key, 0)
+        if version > current:
+            self.partition_applied_versions[key] = version
+        return self.partition_applied_versions[key]
+
+    def applied_partition_version(self, database: str, table: str,
+                                  partition: str) -> int:
+        """查询目标分区当前已应用版本（未应用过返回 0）。"""
+        key = self.partition_key(database, table, partition)
+        return self.partition_applied_versions.get(key, 0)
 
     def compute_event_hash(self, event: ChangeEventRecord) -> str:
         """计算事件的业务去重哈希。"""
@@ -328,6 +410,10 @@ class PipelineBus:
             "scd_type3_keys": len(self.scd_type3_store),
             "audit_count": len(self.audit_log),
             "lag_buffer_size": len(self.lag_buffer),
+            "partition_grant_count": len(self.partition_write_grants),
+            "partition_writable_count": sum(
+                1 for grant in self.partition_write_grants.values() if grant.get("writable")),
+            "partition_applied_count": len(self.partition_applied_versions),
         }
 
 
